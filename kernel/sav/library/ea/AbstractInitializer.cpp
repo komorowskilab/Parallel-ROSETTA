@@ -1,0 +1,23 @@
+// AbstractInitializer.cpp: implementation of the AbstractInitializer class.
+//
+//////////////////////////////////////////////////////////////////////
+
+#include <stdafx.h> // Added 980901 by Aleksander Ührn.
+
+#include "AbstractInitializer.h"
+
+//////////////////////////////////////////////////////////////////////
+// Construction/Destruction
+//////////////////////////////////////////////////////////////////////
+
+AbstractInitializer::AbstractInitializer()
+{
+
+}
+
+AbstractInitializer::~AbstractInitializer()
+{
+
+}
+
+ 

@@ -1,0 +1,822 @@
+//-------------------------------------------------------------------
+// Author........: Aleksander šhrn
+// Date..........:
+// Description...:
+// Revisions.....:
+//===================================================================
+
+#include <stdafx.h> // Precompiled headers.
+#ifdef PARALLEL
+	#include <kernel/parallel/parallel.h>
+#endif
+#include <copyright.h>
+
+#include <kernel/algorithms/serialexecutorloop.h>
+#include <kernel/algorithms/keyword.h>
+#include <kernel/algorithms/batchclassifier.h>
+
+#include <kernel/structures/decisiontable.h>
+#include <kernel/structures/rules.h>
+#include <kernel/structures/batchclassification.h>
+#include <kernel/structures/project.h>
+#include <kernel/structures/projectmanager.h>
+// sus
+#include <kernel/structures/confusionmatrix.h>
+
+#include <kernel/utilities/mathkit.h>
+#include <kernel/utilities/rng.h>
+#include <kernel/utilities/iokit.h>
+#include <kernel/utilities/creator.h>
+
+#include <kernel/basic/message.h>
+
+#include <kernel/system/fstream.h>
+
+#include <common/objectmanager.h>
+
+// temporary hack
+
+//-------------------------------------------------------------------
+// Static methods (file scope)
+//===================================================================
+
+//-------------------------------------------------------------------
+// Method........: StaticCleanUp
+// Author........: Aleksander šhrn
+// Date..........:
+// Description...: Cleans up temp. stuff set in the ExecuteCommands
+//                 method.
+// Comments......:
+// Revisions.....:
+//===================================================================
+
+static void
+StaticCleanUp(SerialExecutorLoop &executor, Id id) {
+
+	// Reset rules.
+	executor.SetRules(Handle<Rules>(NULL));
+
+	// Reset output type.
+	executor.SetOutputType(id);
+
+}
+
+static void
+StaticCleanUp(Project &project, const DecisionTable &table) {
+
+	// Remove project from project pool.
+	ProjectManager::RemoveProject(&project);
+
+	// Find child index.
+	int index = project.FindChild(&table);
+
+	// Remove child.
+	if (index != Undefined::Integer())
+		project.RemoveChild(index);
+
+}
+
+//-------------------------------------------------------------------
+// Method........: StaticGetRules
+// Author........: Aleksander šhrn
+// Date..........:
+// Description...: Returns the last rule set derived from the given
+//                 decision table.
+//
+// Comments......: Current implementation does not test for "lastness"...
+// Revisions.....:
+//===================================================================
+
+static Handle<Rules>
+StaticGetRules(const DecisionTable &table) {
+
+	Handle<Rules>       rules;
+	Identifier::Handles rulesets;
+
+	bool recursive = true;
+
+	// Get all children rulesets. If several, assume that the order in the list is an indication of being "last"...
+	if (table.GetAllChildren(RULES, rulesets, recursive) && !rulesets.empty())
+		rules = dynamic_cast(Rules *, rulesets[rulesets.size() - 1].GetPointer());
+
+	if (rulesets.size() > 1)
+		Message::Warning("More than one rule set detected, selecting one.", false);
+
+	return rules;
+
+}
+
+//-------------------------------------------------------------------
+// Methods for class SerialExecutorLoop
+//===================================================================
+
+//-------------------------------------------------------------------
+// Constructors/destructor.
+//===================================================================
+
+SerialExecutorLoop::SerialExecutorLoop() {
+	SetN(5);
+	SetLength(0);
+}
+
+SerialExecutorLoop::~SerialExecutorLoop() {
+}
+
+//-------------------------------------------------------------------
+// Methods inherited from Identifier.
+//===================================================================
+
+IMPLEMENTIDMETHODS(SerialExecutorLoop, SERIALEXECUTORLOOP, SerialExecutor)
+
+//-------------------------------------------------------------------
+// Methods inherited from Algorithm.
+//===================================================================
+
+//-------------------------------------------------------------------
+// Method........: GetParameters
+// Author........: Aleksander šhrn
+// Date..........:
+// Description...:
+// Comments......:
+// Revisions.....:
+//===================================================================
+
+String
+SerialExecutorLoop::GetParameters() const {
+
+	String parameters;
+
+	// N.
+	parameters += Keyword::Number();
+	parameters += Keyword::Assignment();
+	parameters += String::Format(GetN());
+
+	parameters += Keyword::Separator();
+
+	// Seed.
+	parameters += Keyword::Seed();
+	parameters += Keyword::Assignment();
+	parameters += String::Format(GetSeed());
+
+	parameters += Keyword::Separator();
+
+	// Length.
+	parameters += Keyword::Length();
+	parameters += Keyword::Assignment();
+	parameters += String::Format(GetLength());
+
+	parameters += Keyword::Separator();
+
+	return parameters + SerialExecutor::GetParameters();
+
+}
+
+//-------------------------------------------------------------------
+// Method........: SetParameter
+// Author........: Aleksander šhrn
+// Date..........:
+// Description...:
+// Comments......:
+// Revisions.....:
+//===================================================================
+
+bool
+SerialExecutorLoop::SetParameter(const String &keyword, const String &value) {
+
+	// N.
+	if (keyword == Keyword::Number() && value.IsInteger())
+		return SetN(value.GetInteger());
+
+	// Seed.
+	if (keyword == Keyword::Seed() && value.IsInteger())
+		return SetSeed(value.GetInteger());
+
+	// Length.
+	if (keyword == Keyword::Length() && value.IsInteger())
+		return SetLength(value.GetInteger());
+
+	return SerialExecutor::SetParameter(keyword, value);
+
+}
+
+//-------------------------------------------------------------------
+// Method........: IsApplicable
+// Author........: Aleksander šhrn
+// Date..........:
+// Description...:
+// Comments......:
+// Revisions.....:
+//===================================================================
+
+bool
+SerialExecutorLoop::IsApplicable(const Structure &structure, bool /*warn*/) const {
+	return structure.IsA(DECISIONTABLE);
+}
+
+//-------------------------------------------------------------------
+// Methods inherited from Executor.
+//===================================================================
+
+//-------------------------------------------------------------------
+// Method........: ExecuteCommands
+// Author........: Aleksander šhrn
+// Date..........:
+// Description...: Executes a pipeline with some kind of systematic
+//                 sampling per iteration.
+//
+//                 The input pipeline is split into two pipelines,
+//                 one for training and one for testing.
+//
+//                 Input is a decision table. For each of the n loop
+//                 iterations, the table is split into a training and a
+//                 testing table.
+//
+//                 Starting with the training table, all algorithms in
+//                 the training pipeline are then applied in sequence,
+//                 with the output of one being the input to the next.
+//                 The training pipeline is assumed to produce a set
+//                 of rules along the way.
+//
+//                 Then, starting with the testing table, all algorithms
+//                 in the testing pipeline are applied in sequence,
+//                 with the output of one being the input to the next.
+//                 It is assumed that the testing pipeline produces a
+//                 confusion matrix (via a batch classification structure)
+//                 along the way, typically by a batch classifier.
+//                 The rule set from the training pipeline is used by the
+//                 batch classifier.
+//
+//                 Various statistics are collected from the resulting
+//                 confusion matrix, and dumped to a log file.
+//
+//                 If the desired output type is Undefined::Id(), return
+//                 the input structure unless an error occurs.
+//
+// Comments......: Currently, the training pipelibne is executed by a
+//                 separate SerialExecutor object, while this object
+//                 excutes the training pipeline.
+//
+//                 This method could probably be implemented in a much
+//                 "cleaner" fashion by doing some restructuring
+//                 and using separate SerialExecutor objects for
+//                 both pipelines. That would also eliminate the
+//                 messy temporary project stuff and the clean-up
+//                 methods. However, the current implementation works,
+//                 and "if it ain't broke, don't fix it".
+//
+// Revisions.....:
+//===================================================================
+
+Structure *
+SerialExecutorLoop::ExecuteCommands(Structure &structure, const Algorithm::Handles &algorithms, const Vector(String) &parameters, ofstream &stream) const {
+
+	Message message;
+
+	// Cast, type verified by IsApplicable method.
+	Handle<DecisionTable> table = dynamic_cast(DecisionTable *, &structure);
+
+	Algorithm::Handles algorithms_training; // Algorithms, training pipeline (must produce a rule set).
+	Algorithm::Handles algorithms_testing;  // Algorithms, testing pipeline (should include a batch classifier).
+	Vector(String)     parameters_training; // Parameters, training pipeline.
+	Vector(String)     parameters_testing;  // Parameters, testing pipeline.
+
+	// Split pipeline.
+	if (!SplitCommands(GetLength(), algorithms, parameters, algorithms_training, parameters_training, algorithms_testing, parameters_testing)) {
+		Message::Error("Failed to split command sequence.");
+		return NULL;
+	}
+
+	RNG rng(GetSeed());
+
+	// Operate on a masked table.
+	bool masked = true;
+
+	// This method is conceptually const only.
+	SerialExecutorLoop *self = const_cast(SerialExecutorLoop *, this);
+
+	message.Notify("Initializing sampling scheme...");
+
+	// Initialize sampler.
+	if (!self->InitializeSamplingScheme(*table, masked, rng))
+		return NULL;
+
+	// Get desired output type.
+	Id outputtype = GetOutputType();
+
+	// The structure to output.
+	Handle<Structure> output;
+
+	Vector(float) accuracies;
+	Vector(float) rocareas;
+	Vector(float) rocstderrs;
+
+	ConfusionMatrix confusion_matrix;	// sus
+
+
+	int i, j;
+
+	// Do training/testing loop.
+
+	// LL somewhat temporary structure, 
+	// we would like to have CV as top layer 
+	// like having A * B 
+#ifdef MPI
+	int proc_size = MPI::COMM_WORLD.Get_size();
+	int my_rank = MPI::COMM_WORLD.Get_rank();
+	
+	int start=0;
+	int stop=0;
+
+	if (GetN() >= proc_size){
+
+		// LL: get out from here and put in separate class it has spread use
+		int base = GetN()/proc_size;
+		int remainder = GetN() % proc_size;
+
+		if (my_rank < remainder){
+			 base +=1;
+			 remainder = 0;
+		}
+		else start += remainder;
+
+		start += my_rank*base;
+		stop += start+base;
+
+
+	} else {
+		// temporary message
+		Message::Error("Too many processors.");
+		return NULL;
+	};
+
+	int how_much = stop - start + 1;
+	if (my_rank != 0){
+		
+
+		accuracies.reserve(how_much);
+		rocareas.reserve(how_much);
+		rocstderrs.reserve(how_much);
+
+	} else {
+
+		accuracies.reserve(GetN());
+		rocareas.reserve(GetN());
+		rocstderrs.reserve(GetN());
+
+	};
+	
+	cout << "Process " << my_rank+1 << " of " << proc_size << " iterations " << start << " to " << stop-1 << endl; 
+
+	for (i = start; i < stop; i++) {
+#else
+
+	accuracies.reserve(GetN());
+	rocareas.reserve(GetN());
+	rocstderrs.reserve(GetN());
+	bool skip = false; // return NULL
+
+//	#pragma omp parallel for private(confusion_matrix,message, j, output), shared(outputtype,self,skip,table,masked,rng,parameters_training,parameters_testing,algorithms_training,algorithms_testing,accuracies,rocareas,rocstderrs) default(none)
+	#pragma omp parallel
+	{
+
+	for (i = 0; i < GetN(); i++) {
+
+#endif
+		if (!message.Progress("Executing iteration " + String::Format(i + 1) + "...", i, GetN())) {
+			StaticCleanUp(*self, outputtype);
+			skip = true;
+//			return NULL;
+		}
+	
+		message.Notify("Sampling tables...");
+
+		// Initialize training/testing tables before sampling. Since we don't know if
+		// the input structures get physically modified by any of the algorithms in the
+		// pipeline, we have to operate on duplicates for each iteration.
+		Handle<DecisionTable> training = dynamic_cast(DecisionTable *, table->Duplicate());
+		Handle<DecisionTable> testing  = dynamic_cast(DecisionTable *, table->Duplicate());
+
+		// Sample training/testing tables.
+		if (!SampleTables(i, rng, *training, *testing, masked)) {
+			Message::Error("Failed to sample tables.");
+			StaticCleanUp(*self, outputtype);
+			skip = true;
+//			return NULL;
+		}
+
+		Vector(String) parameters_training_copy = parameters_training;
+		Vector(String) parameters_testing_copy  = parameters_testing;
+
+		// Replace all iteration no. "macros" with index of current iteration. Try to be case-tolerant.
+		for (j = 0; j < parameters_training_copy.size(); j++) {
+			parameters_training_copy[j].Replace("#iteration#", String::Format(i));
+			parameters_training_copy[j].Replace("#ITERATION#", String::Format(i));
+#ifdef MPI
+			parameters_training_copy[j].Replace("#rank#", String::Format(i));
+			parameters_training_copy[j].Replace("#RANK#", String::Format(i));
+#endif
+		}
+		for (j = 0; j < parameters_testing_copy.size(); j++) {
+			parameters_testing_copy[j].Replace("#iteration#", String::Format(i));
+			parameters_testing_copy[j].Replace("#ITERATION#", String::Format(i));
+#ifdef MPI
+			parameters_testing_copy[j].Replace("#rank#", String::Format(i));
+			parameters_testing_copy[j].Replace("#RANK#", String::Format(i));
+#endif
+		}
+
+		// Set up training pipeline. (Executed by separate object.)
+		SerialExecutor pipeline_training;
+
+		// We want the originating decision table so that we get the dictionary as well.
+		pipeline_training.SetOutputType(DECISIONTABLE);
+
+		if (!message.Progress("Executing iteration " + String::Format(i + 1) + ", training pipeline...", i, GetN())) {
+			StaticCleanUp(*self, outputtype);
+			skip = true;
+//			return NULL;
+		}
+
+		message.Notify("so far ok");
+
+		// Execute training pipeline.
+		Handle <DecisionTable> parenttable = dynamic_cast(DecisionTable *, pipeline_training.ExecuteCommands(*training, algorithms_training, parameters_training_copy, stream, false));
+
+
+		message.Notify("ok after training pipeline?");
+
+		if (parenttable == NULL) {
+			Message::Error("Failed to execute training pipeline.");
+			StaticCleanUp(*self, outputtype);
+			skip = true;
+//			return NULL;
+		}
+
+		// Get the last rule set derived from the output decision table.
+		Handle<Rules> rules = StaticGetRules(*parenttable);
+
+		if (rules == NULL) {
+			Message::Error("Unable to locate rule set generated in training pipeline.");
+			StaticCleanUp(*self, outputtype);
+			skip = true;
+//			return NULL;
+		}
+
+		// Temporarily set rules so that they can be employed in the testing pipeline.
+		self->SetRules(rules);
+
+		// Set up a temporary project so that FindParent method will function.
+		Handle<Project> project = Creator::Project();
+
+		if (!ProjectManager::InsertProject(project.GetPointer())) {
+			StaticCleanUp(*self, outputtype);
+			skip = true;
+//			return NULL;
+		}
+
+		if (!project->AppendChild(parenttable.GetPointer())) {
+			StaticCleanUp(*self, outputtype);
+			StaticCleanUp(*project, *parenttable);
+			skip = true;
+//			return NULL;
+		}
+
+		// Set up training pipeline. (Executed by this object.)
+		self->SetOutputType(BATCHCLASSIFICATION);
+
+		if (!message.Progress("Executing iteration " + String::Format(i + 1) + ", testing pipeline...", i, GetN())) {
+			StaticCleanUp(*self, outputtype);
+			skip = true;
+//			return NULL;
+		}
+
+		// Execute testing pipeline.
+		Handle<BatchClassification> batchclassification = dynamic_cast(BatchClassification *, SerialExecutor::ExecuteCommands(*testing, algorithms_testing, parameters_testing_copy, stream));
+
+		if (batchclassification == NULL) {
+			Message::Error("Failed to execute testing pipeline.");
+			StaticCleanUp(*self, outputtype);
+			StaticCleanUp(*project, *parenttable);
+			skip = true;
+//			return NULL;
+		}
+
+		// Display matrix contents in log file.
+		if (!SaveLogEntry(stream, *batchclassification)) {
+			StaticCleanUp(*self, outputtype);
+			StaticCleanUp(*project, *parenttable);
+			skip = true;
+//			return NULL;
+		}
+
+		// Collect statistics for this loop.
+		#pragma omp critical(accuracies)
+		{
+		accuracies.push_back(batchclassification->GetConfusionMatrix().GetDiagonalRatio());
+		}
+
+		// Increse sum of confusion matrices - sus
+		#pragma omp critical(cvmatrix)
+ 		{
+		ConfusionMatrix cvmatrix = batchclassification->GetConfusionMatrix();
+		if (confusion_matrix == NULL)
+			confusion_matrix = cvmatrix;
+		else
+			confusion_matrix += cvmatrix;
+		}
+		
+		if (batchclassification->GetROCArea() != Undefined::Float())
+		{
+			#pragma omp critical(rocareas)
+			rocareas.push_back(batchclassification->GetROCArea());
+		}
+		if (batchclassification->GetROCStandardError() != Undefined::Float())
+		{
+			#pragma omp critical(rocstderrs)
+			rocstderrs.push_back(batchclassification->GetROCStandardError());
+		}
+		// Try to adhere to specified output type.
+		if (batchclassification->IsA(outputtype))
+			output = batchclassification.GetPointer();
+		else if (rules->IsA(outputtype))
+			output = rules.GetPointer();
+		else if (parenttable->IsA(outputtype))
+			output = parenttable.GetPointer();
+		else if (structure.IsA(outputtype))
+			output = &structure;
+
+		// Clean up temporary project stuff.
+		StaticCleanUp(*project, *parenttable);
+
+	}
+	} // Parallel stop
+
+	if (skip) return NULL; // return NULL
+
+	// Clean up.
+	StaticCleanUp(*self, outputtype);
+
+	// MPI collecting data from processors
+#ifdef MPI
+	float* tabl = new float[how_much+1];
+	int which[3];
+	
+	if (my_rank == 0){
+		
+		for (int z=1; z < MPI::COMM_WORLD.Get_size(); z++){
+
+			MPI::COMM_WORLD.Recv(which, 3, MPI_INT, z, 0); 
+
+			MPI::COMM_WORLD.Recv(tabl, which[0], MPI_FLOAT, z, 1);
+			for (int y=0; y<which[0]; y++) accuracies.push_back(tabl[y]);
+
+			if (which[1]){
+				MPI::COMM_WORLD.Recv(tabl, which[0], MPI_FLOAT, z, 2);
+
+				for (int y=0; y<which[0]; y++) rocareas.push_back(tabl[y]);
+			};
+
+			if (which[2]){
+				MPI::COMM_WORLD.Recv(tabl, which[0], MPI_FLOAT, z, 3);
+				for (int y=0; y<which[0]; y++) rocstderrs.push_back(tabl[y]);
+			};
+
+		};
+
+		if (!SaveLogStatistics(stream, accuracies, "Accuracy"))
+			return NULL;
+
+		if (!rocareas.empty() && !SaveLogStatistics(stream, rocareas, "ROC.AUC"))
+			return NULL;
+
+		if (!rocstderrs.empty() && !SaveLogStatistics(stream, rocstderrs, "ROC.AUC.SE"))
+			return NULL;
+
+	} else {
+
+		which[0] = accuracies.size();
+		which[1] = rocareas.size();
+		which[2] = rocstderrs.size();
+
+		MPI::COMM_WORLD.Send(which, 3, MPI_INT, 0, 0);
+
+		for (int y=0; y<which[0]; y++) tabl[y] = accuracies[y];
+		MPI::COMM_WORLD.Send(tabl, which[0], MPI_FLOAT, 0, 1);
+
+		if (which[1]){
+			for (int y=0; y<which[0]; y++) tabl[y] = rocareas[y];
+
+			MPI::COMM_WORLD.Send(tabl, which[0], MPI_FLOAT, 0, 2);
+		};
+
+		if (which[2]){
+			for (int y=0; y<which[0]; y++) tabl[y] = rocstderrs[y];
+
+			MPI::COMM_WORLD.Send(tabl, which[0], MPI_FLOAT, 0, 3);
+		};
+
+	};
+
+	delete[] tabl;
+#else
+	// Display statistics in log file.
+	if (!SaveLogStatistics(stream, accuracies, "Accuracy"))
+		return NULL;
+
+	if (!rocareas.empty() && !SaveLogStatistics(stream, rocareas, "ROC.AUC"))
+		return NULL;
+
+	if (!rocstderrs.empty() && !SaveLogStatistics(stream, rocstderrs, "ROC.AUC.SE"))
+		return NULL;
+
+#endif 
+
+	// Output confusion matrix for whole cv - sus
+	String formatted;
+	String indent(' ', 1 + SystemKit::GetTimestamp().GetLength());
+	confusion_matrix.Format(formatted, indent);
+	stream << endl << formatted << endl;
+
+	if (output == NULL) {
+		if (outputtype == Undefined::Id())
+			output = &structure;
+		else
+			Message::Error("Unable to return a structure of type " + IdHolder::GetClassname(GetOutputType()) + ".");
+	}
+
+	return output.Release();
+
+}
+
+//-------------------------------------------------------------------
+// Methods inherited from SerialExecutor.
+//===================================================================
+
+//-------------------------------------------------------------------
+// Method........: SetSpecialParameters
+// Author........: Aleksander šhrn
+// Date..........:
+// Description...: Used in the testing pipeline.
+//                 If the algorithm is a batch classifier, then set
+//                 rules produced in training pipeline.
+// Comments......:
+// Revisions.....:
+//===================================================================
+
+bool
+SerialExecutorLoop::SetSpecialParameters(Algorithm &algorithm, const String &parameters) const {
+
+	if (!algorithm.IsA(BATCHCLASSIFIER))
+		return true;
+
+	// Cast to verified type.
+	Handle<BatchClassifier> batchclassifier = dynamic_cast(BatchClassifier *, &algorithm);
+
+	// Set rules.
+	if (!batchclassifier->SetRules(GetRules().GetPointer()))
+		return false;
+
+	// Set parameters again, if some of them are for the embedded classifier.
+	algorithm.SetParameters(parameters);
+
+	return true;
+
+}
+
+//-------------------------------------------------------------------
+// New virtual methods.
+//===================================================================
+
+//-------------------------------------------------------------------
+// Method........: SplitCommands
+// Author........: Aleksander šhrn
+// Date..........:
+// Description...: Splits the input commands/parameters and returns
+//                 (in-place) two command/parameter sets.
+// Comments......:
+// Revisions.....:
+//===================================================================
+
+bool
+SerialExecutorLoop::SplitCommands(int index, const Algorithm::Handles &algorithms,  const Vector(String) &parameters, Algorithm::Handles &algorithms1, Vector(String) &parameters1, Algorithm::Handles &algorithms2, Vector(String) &parameters2) const {
+
+	// Clear vectors.
+	algorithms1.erase(algorithms1.begin(), algorithms1.end());
+	algorithms2.erase(algorithms2.begin(), algorithms2.end());
+	parameters1.erase(parameters1.begin(), parameters1.end());
+	parameters2.erase(parameters2.begin(), parameters2.end());
+
+	// Check input.
+	if (algorithms.size() != parameters.size())
+		return false;
+
+	// Check index validity.
+	if (index < 0 || index > algorithms.size())
+		return false;
+
+	int i;
+
+	// Do split.
+	for (i = 0; i < algorithms.size(); i++) {
+		if (i < index) {
+			algorithms1.push_back(algorithms[i]);
+			parameters1.push_back(parameters[i]);
+		}
+		else {
+			algorithms2.push_back(algorithms[i]);
+			parameters2.push_back(parameters[i]);
+		}
+	}
+
+	return true;
+
+}
+
+//-------------------------------------------------------------------
+// Method........: InitializeSamplingScheme
+// Author........: Aleksander šhrn
+// Date..........:
+// Description...: Initializes internals used for partitioning
+//                 data into training and testing sets.
+//
+//                 Default implementation does nothing.
+// Comments......:
+// Revisions.....:
+//===================================================================
+
+bool
+SerialExecutorLoop::InitializeSamplingScheme(const DecisionTable &/*table*/, bool /*masked*/, const RNG &/*rng*/) {
+	return true;
+}
+
+//-------------------------------------------------------------------
+// Method........: SaveLogEntry
+// Author........: Aleksander šhrn
+// Date..........:
+// Description...:
+// Comments......:
+// Revisions.....: Aš 981202: Added ROC information.
+//===================================================================
+
+bool
+SerialExecutorLoop::SaveLogEntry(ofstream &stream, const BatchClassification &batchclassification) const {
+
+	String indent(' ', 1 + SystemKit::GetTimestamp().GetLength());
+
+	String formatted;
+
+	// Output confusion matrix.
+	if (!batchclassification.GetConfusionMatrix().Format(formatted, indent))
+		return false;
+
+	stream << endl << formatted << endl;
+
+	// Output ROC stuff, if present.
+	if (batchclassification.GetROCArea() != Undefined::Float()) {
+		stream << indent << "ROC.AUC    = " << batchclassification.GetROCArea() << endl;
+		stream << indent << "ROC.AUC.SE = " << batchclassification.GetROCStandardError() << endl << endl;
+	}
+
+	return true;
+
+}
+
+//-------------------------------------------------------------------
+// Method........: SaveLogStatistics
+// Author........: Aleksander šhrn
+// Date..........:
+// Description...:
+// Comments......:
+// Revisions.....:
+//===================================================================
+
+bool
+SerialExecutorLoop::SaveLogStatistics(ofstream &stream, const Vector(float) &statistics, const String &name) const {
+
+	String indent(' ', 1 + SystemKit::GetTimestamp().GetLength());
+
+
+	// Compute statistics.
+	float mean    = MathKit::Mean(statistics);
+	float median  = MathKit::Median(statistics);
+	float stddev  = MathKit::StandardDeviation(statistics);
+	float minimum = MathKit::Minimum(statistics);
+	float maximum = MathKit::Maximum(statistics);
+
+	// Format.
+	String formatted_mean    = (mean    == Undefined::Float())? Undefined::String() : String::Format(mean);
+	String formatted_median  = (median  == Undefined::Float())? Undefined::String() : String::Format(median);
+	String formatted_stddev  = (stddev  == Undefined::Float())? Undefined::String() : String::Format(stddev);
+	String formatted_minimum = (minimum == Undefined::Float())? Undefined::String() : String::Format(minimum);
+	String formatted_maximum = (maximum == Undefined::Float())? Undefined::String() : String::Format(maximum);
+
+	stream << indent << name << ".Mean    = " << formatted_mean    << endl;
+	stream << indent << name << ".Median  = " << formatted_median  << endl;
+	stream << indent << name << ".StdDev  = " << formatted_stddev  << endl;
+	stream << indent << name << ".Minimum = " << formatted_minimum << endl;
+	stream << indent << name << ".Maximum = " << formatted_maximum << endl;
+
+	return true;
+
+}
+ 

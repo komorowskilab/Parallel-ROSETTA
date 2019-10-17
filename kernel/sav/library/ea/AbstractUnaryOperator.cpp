@@ -1,0 +1,22 @@
+// AbstractUnaryOperator.cpp: implementation of the AbstractUnaryOperator class.
+//
+//////////////////////////////////////////////////////////////////////
+
+#include <stdafx.h> // Added 980901 by Aleksander Ührn.
+
+#include "AbstractUnaryOperator.h"
+
+//////////////////////////////////////////////////////////////////////
+// Construction/Destruction
+//////////////////////////////////////////////////////////////////////
+
+AbstractUnaryOperator::AbstractUnaryOperator()
+{
+
+}
+
+AbstractUnaryOperator::~AbstractUnaryOperator()
+{
+
+}
+ 
